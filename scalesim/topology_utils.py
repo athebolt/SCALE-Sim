@@ -133,7 +133,7 @@ class topologies(object):
         f = open(topofile, 'r')
         for row in f:
             row = row.strip()
-            if first or row == '':
+            if first or row == '' or row.replace(',', '').strip() == '':
                 first = False
             else:
                 elems = row.split(',')[:-1]
@@ -141,11 +141,14 @@ class topologies(object):
                 # Add the same stride in the col direction automatically
                 elems = elems[0:8] + [elems[7]] + elems[8:]
 
-                # Parsing sparsity ratio
-                if len(elems) < 10:
-                    # If sparsity ratio is missing in the topology file, consider the default ratio
-                    elems.append("1:1")
-                sparsity_ratio = elems.pop().strip().split(':')
+                # Parsing sparsity ratio: only consider the field at index 9 (right after 9 core params)
+                # Truncate to 9 core params first, check original index 9 for sparsity
+                sparsity_field = elems[9].strip() if len(elems) > 9 else "1:1"
+                elems = elems[0:9]
+                if ':' in sparsity_field and sparsity_field != '':
+                    sparsity_ratio = sparsity_field.split(':')
+                else:
+                    sparsity_ratio = ["1", "1"]
                 elems.append(sparsity_ratio[0])
                 elems.append(sparsity_ratio[1])
 
