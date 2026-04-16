@@ -27,6 +27,5 @@ test*
 configs_test
 benchmark_results
 results/
-outputs/
 
 .venv
