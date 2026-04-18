@@ -213,9 +213,20 @@ class simulator:
             header += '\n'
             sparse_report.write(header)
 
+        # Get the number of tensor cores from the config file
+        tensor_cores = self.conf.get_tensor_cores()
+
         for lid in range(len(self.single_layer_sim_object_list)):
             single_layer_obj = self.single_layer_sim_object_list[lid]
             compute_report_items_this_layer = single_layer_obj.get_compute_report_items()
+
+            # Divide cycle counts by tensor_cores to model parallel GPU execution
+            # Only the cycles are divided; utilization percentages stay the same
+            if tensor_cores > 1:
+                compute_report_items_this_layer[0] /= tensor_cores
+                compute_report_items_this_layer[1] /= tensor_cores
+                compute_report_items_this_layer[2] /= tensor_cores
+
             log = str(lid) +', '
             log += ', '.join([str(x) for x in compute_report_items_this_layer])
             log += ',\n'
@@ -251,6 +262,16 @@ class simulator:
             bandwidth_report.write(log)
 
             detail_report_items_this_layer = single_layer_obj.get_detail_report_items()
+
+            # Divide memory access counts by tensor_cores to model parallel GPU execution.
+            # The detail report items are structured as 6 groups of 3 values each:
+            #   [start_cycle, stop_cycle, count] for each of:
+            #   SRAM IFMAP reads, SRAM Filter reads, SRAM OFMAP writes,
+            #   DRAM IFMAP reads, DRAM Filter reads, DRAM OFMAP writes.
+            if tensor_cores > 1:
+                for idx in [2, 5, 8, 11, 14, 17]:
+                    detail_report_items_this_layer[idx] /= tensor_cores
+
             log = str(lid) + ', '
             log += ', '.join([str(x) for x in detail_report_items_this_layer])
             log += ',\n'

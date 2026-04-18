@@ -214,18 +214,18 @@ def run_comparison(ncu_path, scalesim_dir, report_path):
 
     Parameters
     ----------
-    ncu_path     : str  – path to the NCU CSV file
-    scalesim_dir : str  – directory containing SCALE-Sim report CSVs
-    report_path  : str  – where to write comparison_report.txt
+    ncu_path     : str  - path to the NCU CSV file
+    scalesim_dir : str  - directory containing SCALE-Sim report CSVs
+    report_path  : str  - where to write comparison_report.txt
     """
     print("\n" + "=" * 72)
     print("  Hardware vs SCALE-Sim Comparison Report")
     print("=" * 72)
 
-    print("\n[1/3]  Parsing hardware metrics …")
+    print("\n[1/3]  Parsing hardware metrics ...")
     hw = parse_ncu_csv(ncu_path)
 
-    print("[2/3]  Parsing SCALE-Sim results …")
+    print("[2/3]  Parsing SCALE-Sim results ...")
     sim = parse_scalesim_outputs(scalesim_dir)
 
     if hw is None and sim is None:
@@ -275,21 +275,22 @@ def run_comparison(ncu_path, scalesim_dir, report_path):
     print("\n" + "=" * 72)
     print("  SIDE-BY-SIDE COMPARISON")
     print("=" * 72)
-    header = f"{'Metric':<36} {'Hardware (NCU)':>18} {'SCALE-Sim':>18} {'Δ':>10}"
+    header = f"{'Metric':<36} {'Hardware (NCU)':>18} {'SCALE-Sim':>18} {'Change':>10}"
     print(header)
     print("-" * 82)
     for label, hw_val, sim_val in rows:
-        delta = pct_diff(hw_val, sim_val) if not isinstance(hw_val, str) and not isinstance(sim_val, str) else "—"
+        delta = pct_diff(hw_val, sim_val) if not isinstance(hw_val, str) and not isinstance(sim_val, str) else "-"
         print(f"  {label:<34} {fmt(hw_val):>18} {fmt(sim_val):>18} {delta:>10}")
 
     # ---- Write report file ----
-    print(f"\n[3/3]  Writing comparison report …")
+    print(f"\n[3/3]  Writing comparison report ...")
     buf = io.StringIO()
     orig = sys.stdout
     sys.stdout = buf
 
     print("=" * 72)
-    print("  Jetson Orin Nano - Hardware vs SCALE-Sim Comparison Report")
+    run_name = os.path.basename(scalesim_dir.rstrip('/\\'))
+    print(f"  {run_name} - Hardware vs SCALE-Sim Comparison Report")
     print("=" * 72)
     print(f"\n  Hardware profiling: {ncu_path}")
     print(f"  Simulation results: {scalesim_dir}/")
