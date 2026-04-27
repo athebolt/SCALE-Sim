@@ -100,30 +100,38 @@ class simulator:
             return any(k in name_lower for k in conv_keywords) or ("cudnn" in name_lower and "ampere_scudnn" in name_lower)
 
         pivot["is_conv"] = pivot["Kernel Name"].apply(is_conv_kernel)
-        conv_kernels = pivot[pivot["is_conv"] == True].copy()
-        conv_kernels['cycles'] = conv_kernels['sm__cycles_active.avg']
         
-        # We also want memory metrics
-        # L1/L2 sectors sum is typically under l1tex__t_sectors.sum and lts__t_sectors.sum
-        if 'l1tex__t_sectors.sum' in conv_kernels.columns and 'lts__t_sectors.sum' in conv_kernels.columns:
-            conv_kernels['sram_reads'] = (conv_kernels['l1tex__t_sectors.sum'] + conv_kernels['lts__t_sectors.sum']) * 32
-        else:
-            conv_kernels['sram_reads'] = 0
-            
-        if 'dram__bytes_read.sum' in conv_kernels.columns:
-            conv_kernels['dram_reads'] = conv_kernels['dram__bytes_read.sum']
-        else:
-            conv_kernels['dram_reads'] = 0
-            
-        if 'dram__bytes_write.sum' in conv_kernels.columns:
-            conv_kernels['dram_writes'] = conv_kernels['dram__bytes_write.sum']
-        else:
-            conv_kernels['dram_writes'] = 0
+        # Group kernels: Sum all kernels following a conv kernel into that conv kernel's bucket
+        # This captures BatchNorm, ReLU, and elementwise overhead belonging to that logical layer.
+        layer_buckets = []
+        current_layer = None
+        
+        for _, row in pivot.iterrows():
+            if row["is_conv"]:
+                if current_layer is not None:
+                    layer_buckets.append(current_layer)
+                current_layer = {
+                    'cycles': row['sm__cycles_active.avg'],
+                    'sram_reads': (row.get('l1tex__t_sectors.sum', 0) + row.get('lts__t_sectors.sum', 0)) * 32,
+                    'dram_reads': row.get('dram__bytes_read.sum', 0),
+                    'dram_writes': row.get('dram__bytes_write.sum', 0)
+                }
+            elif current_layer is not None:
+                # Add overhead of non-conv kernels (ReLU, BN, etc.) to the memory totals
+                current_layer['sram_reads'] += (row.get('l1tex__t_sectors.sum', 0) + row.get('lts__t_sectors.sum', 0)) * 32
+                current_layer['dram_reads'] += row.get('dram__bytes_read.sum', 0)
+                current_layer['dram_writes'] += row.get('dram__bytes_write.sum', 0)
+                # Note: We don't sum cycles because SCALE-Sim models math latency, 
+                # and these are often overlapping or utility tasks.
+        
+        if current_layer is not None:
+            layer_buckets.append(current_layer)
 
         # Create a list of dicts for each conv kernel
         self.ncu_conv_kernels = []
         import math
         def safe_int(val):
+            if val == "n/a" or val is None: return 0
             try:
                 v = float(str(val).replace(',', ''))
                 if math.isnan(v) or math.isinf(v): return 0
@@ -131,16 +139,12 @@ class simulator:
             except:
                 return 0
 
-        for _, row in conv_kernels.iterrows():
-            cycles = safe_int(row['cycles'])
-            sram_reads = safe_int(row['sram_reads'])
-            dram_reads = safe_int(row['dram_reads'])
-            dram_writes = safe_int(row['dram_writes'])
+        for layer in layer_buckets:
             self.ncu_conv_kernels.append({
-                'cycles': cycles,
-                'sram_reads': sram_reads,
-                'dram_reads': dram_reads,
-                'dram_writes': dram_writes
+                'cycles': safe_int(layer['cycles']),
+                'sram_reads': safe_int(layer['sram_reads']),
+                'dram_reads': safe_int(layer['dram_reads']),
+                'dram_writes': safe_int(layer['dram_writes'])
             })
 
 

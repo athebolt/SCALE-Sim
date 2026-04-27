@@ -39,16 +39,12 @@ def parse_ncu_csv(path):
     df = pd.read_csv(io.StringIO(csv_text))
     df.columns = [c.strip() for c in df.columns]
 
-    def safe_float(v):
-        if pd.isna(v):
-            return float("nan")
-        s = str(v).replace(",", "").strip()
-        if s in ("n/a", "N/A", ""):
-            return float("nan")
+    def safe_float(x):
+        if x == "n/a" or x is None: return 0.0
         try:
-            return float(s)
+            return float(str(x).replace(",", ""))
         except ValueError:
-            return float("nan")
+            return 0.0
 
     df["value"] = df["Metric Value"].apply(safe_float)
 
@@ -59,43 +55,73 @@ def parse_ncu_csv(path):
         aggfunc="first",
     ).reset_index()
 
-    conv_keywords = ["cudnn", "gemm", "conv", "fprop", "xmma", "cutlass", "sgemm"]
-    pivot["is_conv"] = pivot["Kernel Name"].apply(
-        lambda name: any(k in name.lower() for k in conv_keywords)
-    )
+    conv_keywords = ["gemm", "conv", "fprop", "xmma", "cutlass", "sgemm"]
+    exclude_keywords = ["bn_fw", "elementwise", "max_pool", "nchwtonhwc", "nhwctonchw", "offsets"]
 
-    def col(metric):
-        matches = [c for c in pivot.columns if metric in str(c)]
-        return matches[0] if matches else None
+    def is_conv(name):
+        name_lower = name.lower()
+        if "cudnn::bn" in name_lower: return False
+        if any(k in name_lower for k in exclude_keywords): return False
+        return any(k in name_lower for k in conv_keywords) or ("cudnn" in name_lower and "ampere_scudnn" in name_lower)
 
-    cycles_col   = col("sm__cycles_active.avg")
-    tensor_col   = col("sm__pipe_tensor_op_hmma_cycles_active.sum")
-    l1_col       = col("l1tex__t_sectors.sum")
-    l2_col       = col("lts__t_sectors.sum")
-    dram_r_col   = col("dram__bytes_read.sum")
-    dram_w_col   = col("dram__bytes_write.sum")
+    pivot["is_conv"] = pivot["Kernel Name"].apply(is_conv)
 
-    def total(column, subset=None):
-        if column is None:
-            return float("nan")
-        series = pivot[column] if subset is None else pivot.loc[subset, column]
-        return series.dropna().sum()
+    # Grouping logic: Aggregate metrics from following utility kernels into the preceding conv kernel
+    grouped_data = []
+    current_layer = None
 
-    conv_mask = pivot["is_conv"]
+    for _, row in pivot.iterrows():
+        l1 = row.get("l1tex__t_sectors.sum", 0)
+        l2 = row.get("lts__t_sectors.sum", 0)
+        dr = row.get("dram__bytes_read.sum", 0)
+        dw = row.get("dram__bytes_write.sum", 0)
+        cyc = row.get("sm__cycles_active.avg", 0)
+        ten = row.get("sm__pipe_tensor_op_hmma_cycles_active.sum", 0)
+
+        if row["is_conv"]:
+            if current_layer is not None:
+                grouped_data.append(current_layer)
+            current_layer = {
+                "cycles": cyc,
+                "tensor_cycles": ten,
+                "l1": l1,
+                "l2": l2,
+                "dram_r": dr,
+                "dram_w": dw
+            }
+        elif current_layer is not None:
+            current_layer["l1"] += l1
+            current_layer["l2"] += l2
+            current_layer["dram_r"] += dr
+            current_layer["dram_w"] += dw
+            # We don't sum cycles/tensor_cycles as they represent the main op latency
+
+    if current_layer is not None:
+        grouped_data.append(current_layer)
+
+    # Calculate final sums
+    conv_l1 = sum(d["l1"] for d in grouped_data)
+    conv_l2 = sum(d["l2"] for d in grouped_data)
+    conv_dr = sum(d["dram_r"] for d in grouped_data)
+    conv_dw = sum(d["dram_w"] for d in grouped_data)
+    conv_cyc = sum(d["cycles"] for d in grouped_data)
+    conv_ten = sum(d["tensor_cycles"] for d in grouped_data)
 
     return {
         "total_kernels":     len(pivot),
-        "conv_kernels":      int(conv_mask.sum()),
-        "total_cycles":      total(cycles_col),
-        "tensor_cycles":     total(tensor_col),
-        "l1_sectors":        total(l1_col),
-        "l2_sectors":        total(l2_col),
-        "dram_read_bytes":   total(dram_r_col),
-        "dram_write_bytes":  total(dram_w_col),
-        "conv_cycles":       total(cycles_col, conv_mask),
-        "conv_tensor_cycles":total(tensor_col, conv_mask),
-        "conv_l1_sectors":   total(l1_col, conv_mask),
-        "conv_l2_sectors":   total(l2_col, conv_mask),
+        "conv_kernels":      len(grouped_data),
+        "total_cycles":      pivot["sm__cycles_active.avg"].sum() if "sm__cycles_active.avg" in pivot.columns else 0,
+        "tensor_cycles":     pivot["sm__pipe_tensor_op_hmma_cycles_active.sum"].sum() if "sm__pipe_tensor_op_hmma_cycles_active.sum" in pivot.columns else 0,
+        "l1_sectors":        pivot["l1tex__t_sectors.sum"].sum() if "l1tex__t_sectors.sum" in pivot.columns else 0,
+        "l2_sectors":        pivot["lts__t_sectors.sum"].sum() if "lts__t_sectors.sum" in pivot.columns else 0,
+        "dram_read_bytes":   pivot["dram__bytes_read.sum"].sum() if "dram__bytes_read.sum" in pivot.columns else 0,
+        "dram_write_bytes":  pivot["dram__bytes_write.sum"].sum() if "dram__bytes_write.sum" in pivot.columns else 0,
+        "conv_cycles":       conv_cyc,
+        "conv_tensor_cycles":conv_ten,
+        "conv_l1_sectors":   conv_l1,
+        "conv_l2_sectors":   conv_l2,
+        "dram_read_bytes_conv": conv_dr,
+        "dram_write_bytes_conv": conv_dw
     }
 
 
