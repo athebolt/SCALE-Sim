@@ -116,12 +116,14 @@ def parse_scalesim_outputs(report_dir):
         cycle_col       = [c for c in df.columns if "Cycles" in c and "incl" in c.lower()]
         if not cycle_col:
             cycle_col   = [c for c in df.columns if "Cycles" in c and "Stall" not in c]
+        compute_cycle_col = [c for c in df.columns if c.strip() == "Total Cycles"]
         util_col        = [c for c in df.columns if "Overall Util" in c]
         compute_util_col= [c for c in df.columns if "Compute Util" in c]
         stall_col       = [c for c in df.columns if "Stall" in c]
         mapping_col     = [c for c in df.columns if "Mapping" in c]
 
         result["total_cycles"]      = int(df[cycle_col[0]].sum())        if cycle_col        else 0
+        result["compute_cycles"]    = int(df[compute_cycle_col[0]].sum()) if compute_cycle_col else 0
         result["overall_util"]      = float(df[util_col[0]].mean())      if util_col         else 0.0
         result["compute_util"]      = float(df[compute_util_col[0]].mean()) if compute_util_col else 0.0
         result["total_stall_cycles"]= int(df[stall_col[0]].sum())        if stall_col        else 0
@@ -190,18 +192,19 @@ def _build_rows(hw, sim):
                      hw.get("conv_cycles"),
                      sim.get("total_cycles")))
 
-        hw_sram  = hw.get("conv_l1_sectors", 0) + hw.get("conv_l2_sectors", 0)
+        # HW SRAM is in sectors (32 bytes). SIM SRAM is in words (assume 1 byte).
+        hw_sram  = (hw.get("conv_l1_sectors", 0) + hw.get("conv_l2_sectors", 0)) * 32
         sim_sram = sim.get("sram_reads", 0) + sim.get("sram_writes", 0)
-        rows.append(("On-chip Memory Access", hw_sram, sim_sram))
+        rows.append(("On-chip Memory Access (Bytes)", hw_sram, sim_sram))
 
         dram_hw  = hw.get("dram_read_bytes", float("nan")) + hw.get("dram_write_bytes", float("nan"))
         hw_dram  = "N/A (unified mem)" if dram_hw != dram_hw else dram_hw
         sim_dram = sim.get("dram_reads", 0) + sim.get("dram_writes", 0)
-        rows.append(("Off-chip (DRAM) Access", hw_dram, sim_dram))
+        rows.append(("Off-chip (DRAM) Access (Bytes)", hw_dram, sim_dram))
 
-        rows.append(("Tensor Util (cycles / %)",
+        rows.append(("Tensor Compute Cycles",
                      hw.get("conv_tensor_cycles"),
-                     f"{sim.get('overall_util', 0):.1f}%"))
+                     sim.get("compute_cycles")))
     return rows
 
 
