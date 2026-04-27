@@ -56,7 +56,8 @@ if __name__ == '__main__':
                  config=config,
                  topology=topology,
                  layout=layout,
-                 input_type_gemm=GEMM_INPUT
+                 input_type_gemm=GEMM_INPUT,
+                 ncu_metrics=ncu_metrics
                  )
     s.run_scale(top_path=logpath)
 

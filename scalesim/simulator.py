@@ -4,6 +4,8 @@ This file contains the 'simulator' class that simulates the entire model using t
 """
 
 import os
+import pandas as pd
+import io
 
 from scalesim.scale_config import scale_config as cfg
 from scalesim.topology_utils import topologies as topo
@@ -43,7 +45,8 @@ class simulator:
                    layout_obj=layout(),
                    top_path="./",
                    verbosity=True,
-                   save_trace=True
+                   save_trace=True,
+                   ncu_metrics=''
                    ):
         """
         Method to set the run parameters including inputs and parameters for housekeeping.
@@ -55,11 +58,91 @@ class simulator:
         self.top_path = top_path
         self.verbose = verbosity
         self.save_trace = save_trace
+        self.ncu_metrics = ncu_metrics
+        self.ncu_conv_kernels = []
+
+        if self.ncu_metrics and os.path.exists(self.ncu_metrics):
+            self.parse_ncu_metrics(self.ncu_metrics)
 
         # Calculate inferrable parameters here
         self.num_layers = self.topo.get_num_layers()
 
         self.params_set_flag = True
+
+    def parse_ncu_metrics(self, path):
+        with open(path, "r") as f:
+            lines = f.readlines()
+        header_idx = None
+        for i, line in enumerate(lines):
+            if line.startswith('"ID"'):
+                header_idx = i
+                break
+        if header_idx is None: return
+
+        csv_text = "".join(lines[header_idx:])
+        df = pd.read_csv(io.StringIO(csv_text))
+        df.columns = [c.strip() for c in df.columns]
+
+        pivot = df.pivot_table(
+            index=["ID", "Kernel Name"],
+            columns="Metric Name",
+            values="Metric Value",
+            aggfunc="first",
+        ).reset_index()
+
+        conv_keywords = ["gemm", "conv", "fprop", "xmma", "cutlass", "sgemm"]
+        exclude_keywords = ["bn_fw", "elementwise", "max_pool", "nchwtonhwc", "nhwctonchw", "offsets"]
+
+        def is_conv_kernel(name):
+            name_lower = name.lower()
+            if "cudnn::bn" in name_lower: return False
+            if any(k in name_lower for k in exclude_keywords): return False
+            return any(k in name_lower for k in conv_keywords) or ("cudnn" in name_lower and "ampere_scudnn" in name_lower)
+
+        pivot["is_conv"] = pivot["Kernel Name"].apply(is_conv_kernel)
+        conv_kernels = pivot[pivot["is_conv"] == True].copy()
+        conv_kernels['cycles'] = conv_kernels['sm__cycles_active.avg']
+        
+        # We also want memory metrics
+        # L1/L2 sectors sum is typically under l1tex__t_sectors.sum and lts__t_sectors.sum
+        if 'l1tex__t_sectors.sum' in conv_kernels.columns and 'lts__t_sectors.sum' in conv_kernels.columns:
+            conv_kernels['sram_reads'] = (conv_kernels['l1tex__t_sectors.sum'] + conv_kernels['lts__t_sectors.sum']) * 32
+        else:
+            conv_kernels['sram_reads'] = 0
+            
+        if 'dram__bytes_read.sum' in conv_kernels.columns:
+            conv_kernels['dram_reads'] = conv_kernels['dram__bytes_read.sum']
+        else:
+            conv_kernels['dram_reads'] = 0
+            
+        if 'dram__bytes_write.sum' in conv_kernels.columns:
+            conv_kernels['dram_writes'] = conv_kernels['dram__bytes_write.sum']
+        else:
+            conv_kernels['dram_writes'] = 0
+
+        # Create a list of dicts for each conv kernel
+        self.ncu_conv_kernels = []
+        import math
+        def safe_int(val):
+            try:
+                v = float(str(val).replace(',', ''))
+                if math.isnan(v) or math.isinf(v): return 0
+                return int(v)
+            except:
+                return 0
+
+        for _, row in conv_kernels.iterrows():
+            cycles = safe_int(row['cycles'])
+            sram_reads = safe_int(row['sram_reads'])
+            dram_reads = safe_int(row['dram_reads'])
+            dram_writes = safe_int(row['dram_writes'])
+            self.ncu_conv_kernels.append({
+                'cycles': cycles,
+                'sram_reads': sram_reads,
+                'dram_reads': dram_reads,
+                'dram_writes': dram_writes
+            })
+
 
     #
     def run(self):
@@ -219,13 +302,53 @@ class simulator:
         for lid in range(len(self.single_layer_sim_object_list)):
             single_layer_obj = self.single_layer_sim_object_list[lid]
             compute_report_items_this_layer = single_layer_obj.get_compute_report_items()
+            bandwidth_report_items_this_layer = single_layer_obj.get_bandwidth_report_items()
+            detail_report_items_this_layer = single_layer_obj.get_detail_report_items()
 
-            # Divide cycle counts by tensor_cores to model parallel GPU execution
-            # Only the cycles are divided; utilization percentages stay the same
-            if tensor_cores > 1:
+            layer_target = self.topo.get_layer_target(lid)
+
+            if layer_target == 'GPU' and len(self.ncu_conv_kernels) > lid:
+                ncu_metrics = self.ncu_conv_kernels[lid]
+                cycles = ncu_metrics['cycles']
+                sram_reads = ncu_metrics['sram_reads']
+                dram_reads = ncu_metrics['dram_reads']
+                dram_writes = ncu_metrics['dram_writes']
+
+                # Override Compute items: Total, Compute, Stall
+                compute_report_items_this_layer[0] = cycles
+                compute_report_items_this_layer[1] = cycles
+                compute_report_items_this_layer[2] = 0
+                
+                # Override Detailed Memory Access Counts
+                detail_report_items_this_layer[2] = sram_reads
+                detail_report_items_this_layer[5] = 0
+                detail_report_items_this_layer[8] = 0
+                detail_report_items_this_layer[11] = dram_reads
+                detail_report_items_this_layer[14] = 0
+                detail_report_items_this_layer[17] = dram_writes
+
+                # Override Bandwidth items: simple average
+                if self.conf.sparsity_support is True:
+                    bandwidth_report_items_this_layer[0] = sram_reads / cycles if cycles > 0 else 0
+                    for i in range(1, 4): bandwidth_report_items_this_layer[i] = 0
+                    bandwidth_report_items_this_layer[4] = dram_reads / cycles if cycles > 0 else 0
+                    bandwidth_report_items_this_layer[5] = 0
+                    bandwidth_report_items_this_layer[6] = dram_writes / cycles if cycles > 0 else 0
+                else:
+                    bandwidth_report_items_this_layer[0] = sram_reads / cycles if cycles > 0 else 0
+                    for i in range(1, 3): bandwidth_report_items_this_layer[i] = 0
+                    bandwidth_report_items_this_layer[3] = dram_reads / cycles if cycles > 0 else 0
+                    bandwidth_report_items_this_layer[4] = 0
+                    bandwidth_report_items_this_layer[5] = dram_writes / cycles if cycles > 0 else 0
+
+            elif layer_target == 'GPU' and tensor_cores > 1:
+                # Fallback to crude analytical model if NCU metrics not present
                 compute_report_items_this_layer[0] /= tensor_cores
                 compute_report_items_this_layer[1] /= tensor_cores
                 compute_report_items_this_layer[2] /= tensor_cores
+                
+                for idx in [2, 5, 8, 11, 14, 17]:
+                    detail_report_items_this_layer[idx] /= tensor_cores
 
             log = str(lid) +', '
             log += ', '.join([str(x) for x in compute_report_items_this_layer])
@@ -255,22 +378,10 @@ class simulator:
             time_log = str(lid) + ', ' + str(time_us) + ',\n'
             time_report.write(time_log)
 
-            bandwidth_report_items_this_layer = single_layer_obj.get_bandwidth_report_items()
             log = str(lid) + ', '
             log += ', '.join([str(x) for x in bandwidth_report_items_this_layer])
             log += ',\n'
             bandwidth_report.write(log)
-
-            detail_report_items_this_layer = single_layer_obj.get_detail_report_items()
-
-            # Divide memory access counts by tensor_cores to model parallel GPU execution.
-            # The detail report items are structured as 6 groups of 3 values each:
-            #   [start_cycle, stop_cycle, count] for each of:
-            #   SRAM IFMAP reads, SRAM Filter reads, SRAM OFMAP writes,
-            #   DRAM IFMAP reads, DRAM Filter reads, DRAM OFMAP writes.
-            if tensor_cores > 1:
-                for idx in [2, 5, 8, 11, 14, 17]:
-                    detail_report_items_this_layer[idx] /= tensor_cores
 
             log = str(lid) + ', '
             log += ', '.join([str(x) for x in detail_report_items_this_layer])
