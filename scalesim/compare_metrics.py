@@ -344,7 +344,10 @@ def run_comparison(ncu_path, scalesim_dir, report_path):
         print(f"  DRAM writes      : {fmt(sim.get('dram_writes'))}")
 
     if hw and sim:
-        print(f"\n  --- Comparison ---")
+        print(f"\n  --- Comparison ---\n")
+        header = f"  {'Metric':<34} {'Hardware (NCU)':>18} {'SCALE-Sim':>18} {'Change':>10}"
+        print(header)
+        print(f"  {'-' * 83}")
         for label, hw_val, sim_val in rows:
             delta = pct_diff(hw_val, sim_val) if not isinstance(hw_val, str) and not isinstance(sim_val, str) else "-"
             print(f"  {label:<34} {fmt(hw_val):>18} {fmt(sim_val):>18} {delta:>10}")
