@@ -423,7 +423,9 @@ class read_buffer:
         self.last_prefetch_cycle = int(np.max(response_cycles_arr))
 
         # Update the trace matrix
-        self.trace_matrix = np.column_stack((response_cycles_arr, prefetch_requests))
+        #self.trace_matrix = np.column_stack((response_cycles_arr, prefetch_requests))
+        self.external_start_cycle = np.amin(response_cycles_arr)
+        self.external_end_cycle = np.amax(response_cycles_arr)
         self.trace_valid = True
 
         # Set active buffer contents
@@ -518,8 +520,9 @@ class read_buffer:
         #assert response_cycles_arr.shape == cycles_arr.shape, \
         #       'The request and response cycles dims do not match'
 
-        this_prefetch_trace = np.column_stack((response_cycles_arr, prefetch_requests))
-        self.trace_matrix = np.concatenate((self.trace_matrix, this_prefetch_trace), axis=0)
+        #this_prefetch_trace = np.column_stack((response_cycles_arr, prefetch_requests))
+        #self.trace_matrix = np.concatenate((self.trace_matrix, this_prefetch_trace), axis=0)
+        self.external_end_cycle = max(self.external_end_cycle, np.amax(response_cycles_arr))
 
         # Set the line to be prefetched next
         if requested_data_size > self.active_buf_size:
@@ -569,8 +572,10 @@ class read_buffer:
         Method to get start and stop cycles of the read buffer if trace_valid flag is set.
         """
         assert self.trace_valid, 'Traces not ready yet'
-        start_cycle = np.amin(self.trace_matrix[:,0])
-        end_cycle = np.amax(self.trace_matrix[:,0])
+        # start_cycle = np.amin(self.trace_matrix[:,0])
+        # end_cycle = np.amax(self.trace_matrix[:,0])
+        start_cycle = self.external_start_cycle
+        end_cycle = self.external_end_cycle
 
         return start_cycle, end_cycle
 
@@ -584,3 +589,21 @@ class read_buffer:
             return
 
         np.savetxt(filename, self.trace_matrix, fmt='%s', delimiter=",")
+
+    def update_word_size(self, new_word_size):
+        """
+        Updates the word size and recalculates buffer element capacities.
+        """
+        import math
+        self.word_size = new_word_size
+        self.total_size_elems = math.floor(self.total_size_bytes / self.word_size)
+        
+        # Recalculate active and prefetch/drain partitions
+        self.active_buf_size = int(math.ceil(self.total_size_elems * self.active_buf_frac))
+        
+        # Note: In write_buffer.py, this next variable might be called 
+        # 'drain_buf_size' instead of 'prefetch_buf_size'. Adjust accordingly!
+        if hasattr(self, 'prefetch_buf_size'):
+            self.prefetch_buf_size = self.total_size_elems - self.active_buf_size
+        elif hasattr(self, 'drain_buf_size'):
+            self.drain_buf_size = self.total_size_elems - self.active_buf_size

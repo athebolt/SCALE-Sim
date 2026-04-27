@@ -3,6 +3,7 @@ This file contains the 'simulator' class that simulates the entire model using t
 'single_layer_sim' and generates the reports (.csv files).
 """
 
+import math
 import os
 
 from scalesim.scale_config import scale_config as cfg
@@ -10,6 +11,7 @@ from scalesim.topology_utils import topologies as topo
 from scalesim.layout_utils import layouts as layout
 from scalesim.single_layer_sim import single_layer_sim as layer_sim
 from scalesim.linear_model.tpu import tpuv4_linear_model, tpuv5e_linear_model, tpuv6e_linear_model
+from scalesim.linear_model.gpu import ga10b_linear_model
 
 
 class simulator:
@@ -32,6 +34,9 @@ class simulator:
         self.num_layers = 0
 
         self.single_layer_sim_object_list = []
+
+        # GPU-mode analytical results (populated when GPU mode is active)
+        self.gpu_layer_results = []
 
         self.params_set_flag = False
         self.all_layer_run_done = False
@@ -72,17 +77,6 @@ class simulator:
         """
         assert self.params_set_flag, 'Simulator parameters are not set'
 
-        # 1. Create the layer runners for each layer
-        for i in range(self.num_layers):
-            this_layer_sim = layer_sim()
-            this_layer_sim.set_params(layer_id=i,
-                                 config_obj=self.conf,
-                                 topology_obj=self.topo,
-                                 layout_obj=self.layout,
-                                 verbose=self.verbose)
-
-            self.single_layer_sim_object_list.append(this_layer_sim)
-
         if not os.path.isdir(self.top_path):
             os.mkdir(self.top_path)
 
@@ -92,6 +86,32 @@ class simulator:
             os.mkdir(report_path)
 
         self.top_path = report_path
+
+        self._run_standard()
+
+        self.all_layer_run_done = True
+        self.generate_reports()
+
+    #
+    def _run_standard(self):
+        """
+        Standard SCALE-Sim simulation path: runs full cycle-accurate memory trace
+        simulation for each layer using single_layer_sim objects.
+        """
+        # 1. Create the layer runners for each layer
+        for i in range(self.num_layers):
+            this_layer_sim = layer_sim()
+            this_layer_sim.set_params(layer_id=i,
+                                 config_obj=self.conf,
+                                 topology_obj=self.topo,
+                                 layout_obj=self.layout,
+                                 verbose=self.verbose)
+            
+            # Prevent OOM in GPU mode by forcing ESTIMATE BANDWIDTH mode (disables massive traces)
+            if self.conf.is_gpu_mode():
+                this_layer_sim.config.use_user_dram_bandwidth = lambda: False
+
+            self.single_layer_sim_object_list.append(this_layer_sim)
 
         # 2. Run each layer
         # TODO: This is parallelizable
@@ -156,10 +176,6 @@ class simulator:
                 if self.verbose:
                     print('Done!')
 
-        self.all_layer_run_done = True
-
-        self.generate_reports()
-
     #
     def generate_reports(self):
         """
@@ -169,6 +185,13 @@ class simulator:
         and SPARSE_REPORT.csv files.
         """
         assert self.all_layer_run_done, 'Layer runs are not done yet'
+
+        # Determine if GPU mode is active
+        gpu_mode = self.conf.is_gpu_mode()
+        tensor_cores = self.conf.get_tensor_cores() if gpu_mode else 1
+        operand_size = self.conf.get_operand_size() if gpu_mode else 1
+        clock_freq_mhz = self.conf.get_clock_freq_mhz() if gpu_mode else 1000
+        num_sms = self.conf.get_num_sms() if gpu_mode else 1
 
         compute_report_name = self.top_path + '/COMPUTE_REPORT.csv'
         compute_report = open(compute_report_name, 'w')
@@ -213,67 +236,98 @@ class simulator:
             header += '\n'
             sparse_report.write(header)
 
-        # Get the number of tensor cores from the config file
-        tensor_cores = self.conf.get_tensor_cores()
-
         for lid in range(len(self.single_layer_sim_object_list)):
             single_layer_obj = self.single_layer_sim_object_list[lid]
-            compute_report_items_this_layer = single_layer_obj.get_compute_report_items()
+            comp_items = list(single_layer_obj.get_compute_report_items())
+            bw_items = list(single_layer_obj.get_bandwidth_report_items())
+            det_items = list(single_layer_obj.get_detail_report_items())
 
-            # Divide cycle counts by tensor_cores to model parallel GPU execution
-            # Only the cycles are divided; utilization percentages stay the same
-            if tensor_cores > 1:
-                compute_report_items_this_layer[0] /= tensor_cores
-                compute_report_items_this_layer[1] /= tensor_cores
-                compute_report_items_this_layer[2] /= tensor_cores
+            if gpu_mode:
+                # GPU Scaling: mathematically divide base cycles by TensorCores and calculate memory bounds.
+                # comp_items = [Total Cycles, Compute Cycles, Stall Cycles, Util %, Mapping Eff %]
+                base_compute_cycles = comp_items[1]
+                
+                scaled_compute_cycles = base_compute_cycles / tensor_cores
+                
+                # To find memory bound, sum all SRAM reads/writes from det_items
+                # det_items = [
+                #   0, 1, 2(IFMAP reads), 3, 4, 5(Filter reads), 6, 7, 8(OFMAP writes)
+                #   9, 10, 11(DRAM reads), ...
+                # ]
+                sram_ifmap_reads = det_items[2]
+                sram_filter_reads = det_items[5]
+                sram_ofmap_writes = det_items[8]
+                
+                total_sram_words = sram_ifmap_reads + sram_filter_reads + sram_ofmap_writes
+                total_sram_bytes = total_sram_words * operand_size
+                
+                # Peak bandwidth in bytes per cycle
+                max_bw_bytes_per_cycle = (self.conf.get_total_bandwidth_gbs() * 1e9) / (clock_freq_mhz * 1e6)
+                memory_bound_cycles = total_sram_bytes / max_bw_bytes_per_cycle if max_bw_bytes_per_cycle > 0 else 0
+                
+                final_cycles = max(scaled_compute_cycles, memory_bound_cycles)
+                final_stall_cycles = max(0, final_cycles - scaled_compute_cycles)
+                
+                # Update compute items
+                comp_items[0] = final_cycles # Total Cycles (incl prefetch)
+                comp_items[1] = final_cycles # Total Cycles
+                comp_items[2] = final_stall_cycles # Stall Cycles
+                
+                # Re-calculate Util
+                base_util = comp_items[3]
+                comp_items[3] = (base_util * base_compute_cycles) / (final_cycles * tensor_cores) if final_cycles > 0 else 0
+                
+                # Update bandwidth items (bytes/cycle or words/cycle)
+                if self.conf.sparsity_support is True:
+                    bw_items[0] = sram_ifmap_reads / final_cycles if final_cycles > 0 else 0
+                    bw_items[1] = sram_filter_reads / final_cycles if final_cycles > 0 else 0
+                    bw_items[3] = sram_ofmap_writes / final_cycles if final_cycles > 0 else 0
+                else:
+                    bw_items[0] = sram_ifmap_reads / final_cycles if final_cycles > 0 else 0
+                    bw_items[1] = sram_filter_reads / final_cycles if final_cycles > 0 else 0
+                    bw_items[2] = sram_ofmap_writes / final_cycles if final_cycles > 0 else 0
+                
+                # Update detail items with final cycles
+                det_items[1] = final_cycles # IFMAP stop
+                det_items[4] = final_cycles # Filter stop
+                det_items[7] = final_cycles # OFMAP stop
+                
+                # Save scaled final cycle to the single_layer_obj so get_total_cycles can read it
+                single_layer_obj.total_cycles_for_gpu = final_cycles
 
             log = str(lid) +', '
-            log += ', '.join([str(x) for x in compute_report_items_this_layer])
+            log += ', '.join([str(x) for x in comp_items])
             log += ',\n'
             compute_report.write(log)
             
             # Generate TIME_REPORT entry using linear model
-            total_cycles = compute_report_items_this_layer[1]  # Total Cycles (not including prefetch)
+            total_cycles = comp_items[1]
             time_linear_model = self.conf.get_time_linear_model()
             
-            # Get spatiotemporal dimensions for this layer
             dataflow = self.conf.get_dataflow()
             s_row, s_col, t_time = self.topo.get_spatiotemporal_dims(layer_id=lid, df=dataflow)
             
-            
-            # Apply the appropriate linear model based on config
             if time_linear_model == 'TPUv4':
                 time_us = tpuv4_linear_model(total_cycles, s_row, s_col, t_time)
             elif time_linear_model == 'TPUv5e':
                 time_us = tpuv5e_linear_model(total_cycles, s_row, s_col, t_time)
             elif time_linear_model == 'TPUv6e':
                 time_us = tpuv6e_linear_model(total_cycles, s_row, s_col, t_time)
+            elif time_linear_model == 'GA10b':
+                time_us = ga10b_linear_model(total_cycles, s_row, s_col, t_time)
             else:
-                # Default: no conversion, just use cycles as time
                 time_us = total_cycles
             
             time_log = str(lid) + ', ' + str(time_us) + ',\n'
             time_report.write(time_log)
 
-            bandwidth_report_items_this_layer = single_layer_obj.get_bandwidth_report_items()
             log = str(lid) + ', '
-            log += ', '.join([str(x) for x in bandwidth_report_items_this_layer])
+            log += ', '.join([str(x) for x in bw_items])
             log += ',\n'
             bandwidth_report.write(log)
 
-            detail_report_items_this_layer = single_layer_obj.get_detail_report_items()
-
-            # Divide memory access counts by tensor_cores to model parallel GPU execution.
-            # The detail report items are structured as 6 groups of 3 values each:
-            #   [start_cycle, stop_cycle, count] for each of:
-            #   SRAM IFMAP reads, SRAM Filter reads, SRAM OFMAP writes,
-            #   DRAM IFMAP reads, DRAM Filter reads, DRAM OFMAP writes.
-            if tensor_cores > 1:
-                for idx in [2, 5, 8, 11, 14, 17]:
-                    detail_report_items_this_layer[idx] /= tensor_cores
-
             log = str(lid) + ', '
-            log += ', '.join([str(x) for x in detail_report_items_this_layer])
+            log += ', '.join([str(x) for x in det_items])
             log += ',\n'
             detail_report.write(log)
 
@@ -301,8 +355,10 @@ class simulator:
 
         total_cycles = 0
         for layer_obj in self.single_layer_sim_object_list:
-            cycles_this_layer = int(layer_obj.get_compute_report_items[0])
+            if hasattr(layer_obj, 'total_cycles_for_gpu'):
+                cycles_this_layer = int(layer_obj.total_cycles_for_gpu)
+            else:
+                cycles_this_layer = int(layer_obj.get_compute_report_items()[0])
             total_cycles += cycles_this_layer
 
         return total_cycles
-

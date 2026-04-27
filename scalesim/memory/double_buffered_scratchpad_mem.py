@@ -166,6 +166,15 @@ class double_buffered_scratchpad:
 
         self.verbose = verbose
 
+        operand_size = self.config.get_operand_size()
+        
+        if hasattr(self.ifmap_buf, 'update_word_size'):
+            self.ifmap_buf.update_word_size(operand_size)
+        if hasattr(self.filter_buf, 'update_word_size'):
+            self.filter_buf.update_word_size(operand_size)
+        if hasattr(self.ofmap_buf, 'update_word_size'):
+            self.ofmap_buf.update_word_size(operand_size)
+
         self.using_ifmap_custom_layout = using_ifmap_custom_layout  
         self.using_filter_custom_layout = using_filter_custom_layout  
         self.params_valid_flag = True

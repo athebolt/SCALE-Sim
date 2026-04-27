@@ -82,20 +82,30 @@ def parse_ncu_csv(path):
         return series.dropna().sum()
 
     conv_mask = pivot["is_conv"]
+    conv_df = pivot[conv_mask]
+
+    # Normalize to single inference pass: the NCU trace may contain multiple
+    # profiling passes (e.g., 168 conv kernels for 21 ResNet layers = ~8 passes).
+    # Average each unique kernel name's metrics, then sum across unique kernels.
+    def single_pass_total(column):
+        if column is None:
+            return float("nan")
+        return conv_df.groupby("Kernel Name")[column].mean().sum()
 
     return {
         "total_kernels":     len(pivot),
         "conv_kernels":      int(conv_mask.sum()),
+        "unique_conv_kernels": len(conv_df["Kernel Name"].unique()),
         "total_cycles":      total(cycles_col),
         "tensor_cycles":     total(tensor_col),
         "l1_sectors":        total(l1_col),
         "l2_sectors":        total(l2_col),
         "dram_read_bytes":   total(dram_r_col),
         "dram_write_bytes":  total(dram_w_col),
-        "conv_cycles":       total(cycles_col, conv_mask),
-        "conv_tensor_cycles":total(tensor_col, conv_mask),
-        "conv_l1_sectors":   total(l1_col, conv_mask),
-        "conv_l2_sectors":   total(l2_col, conv_mask),
+        "conv_cycles":       single_pass_total(cycles_col),
+        "conv_tensor_cycles":single_pass_total(tensor_col),
+        "conv_l1_sectors":   single_pass_total(l1_col),
+        "conv_l2_sectors":   single_pass_total(l2_col),
     }
 
 
@@ -190,18 +200,38 @@ def _build_rows(hw, sim):
                      hw.get("conv_cycles"),
                      sim.get("total_cycles")))
 
-        hw_sram  = hw.get("conv_l1_sectors", 0) + hw.get("conv_l2_sectors", 0)
-        sim_sram = sim.get("sram_reads", 0) + sim.get("sram_writes", 0)
-        rows.append(("On-chip Memory Access", hw_sram, sim_sram))
+        # On-chip memory comparison:
+        # HW: L1 + L2 sectors (1 sector = 32 bytes)
+        # Sim: SRAM reads + writes in words (1 word = operand_size bytes, typically 2)
+        # Convert sim words → sectors for apples-to-apples comparison
+        hw_sram_sectors = hw.get("conv_l1_sectors", 0) + hw.get("conv_l2_sectors", 0)
+        sim_sram_words  = sim.get("sram_reads", 0) + sim.get("sram_writes", 0)
+        # Convert words to bytes, then to sectors (32 bytes per sector)
+        operand_bytes = 2  # FP16/BF16
+        sim_sram_sectors = (sim_sram_words * operand_bytes) / 32
+        rows.append(("On-chip Memory (sectors)",
+                     int(hw_sram_sectors), int(sim_sram_sectors)))
 
         dram_hw  = hw.get("dram_read_bytes", float("nan")) + hw.get("dram_write_bytes", float("nan"))
-        hw_dram  = "N/A (unified mem)" if dram_hw != dram_hw else dram_hw
-        sim_dram = sim.get("dram_reads", 0) + sim.get("dram_writes", 0)
-        rows.append(("Off-chip (DRAM) Access", hw_dram, sim_dram))
+        # Only include the DRAM comparison row when hardware data is available.
+        # When hardware reports N/A (e.g. unified memory), skip the row entirely.
+        # DRAM is still tracked in SCALE-Sim reports — just not compared here.
+        if dram_hw == dram_hw:  # not NaN
+            sim_dram = sim.get("dram_reads", 0) + sim.get("dram_writes", 0)
+            rows.append(("Off-chip (DRAM) Access", dram_hw, sim_dram))
 
-        rows.append(("Tensor Util (cycles / %)",
-                     hw.get("conv_tensor_cycles"),
-                     f"{sim.get('overall_util', 0):.1f}%"))
+        # Tensor utilization: convert both to percentage for fair comparison.
+        # HW: tensor_cycles is summed across all SMs per kernel,
+        #     sm_cycles is averaged across SMs per kernel.
+        #     So: hw_util = tensor_cycles / (sm_cycles × num_SMs) × 100
+        hw_tensor_cycles = hw.get("conv_tensor_cycles", 0)
+        hw_sm_cycles = hw.get("conv_cycles", 1)
+        num_sms = 8  # GA10b has 8 SMs
+        hw_tensor_util = (hw_tensor_cycles / (hw_sm_cycles * num_sms)) * 100 if hw_sm_cycles > 0 else 0
+        sim_tensor_util = sim.get('overall_util', 0)
+        rows.append(("Tensor Core Util (%)",
+                     f"{hw_tensor_util:.1f}%",
+                     f"{sim_tensor_util:.1f}%"))
     return rows
 
 
@@ -296,7 +326,8 @@ def run_comparison(ncu_path, scalesim_dir, report_path):
     print(f"  Simulation results: {scalesim_dir}/")
 
     if hw:
-        print(f"\n  --- Hardware (conv kernels) ---")
+        print(f"\n  --- Hardware (conv kernels, single-pass normalized) ---")
+        print(f"  Total conv kernels: {fmt(hw.get('conv_kernels'))} ({fmt(hw.get('unique_conv_kernels'))} unique)")
         print(f"  SM cycles        : {fmt(hw.get('conv_cycles'))}")
         print(f"  Tensor cycles    : {fmt(hw.get('conv_tensor_cycles'))}")
         print(f"  L1 sectors       : {fmt(hw.get('conv_l1_sectors'))}")
@@ -306,15 +337,30 @@ def run_comparison(ncu_path, scalesim_dir, report_path):
         print(f"\n  --- SCALE-Sim ---")
         print(f"  Total cycles     : {fmt(sim.get('total_cycles'))}")
         print(f"  Avg utilization  : {fmt(sim.get('overall_util'), '%')}")
-        print(f"  SRAM reads       : {fmt(sim.get('sram_reads'))}")
-        print(f"  SRAM writes      : {fmt(sim.get('sram_writes'))}")
+        print(f"  SRAM reads       : {fmt(sim.get('sram_reads'))} words")
+        print(f"  SRAM writes      : {fmt(sim.get('sram_writes'))} words")
+        sram_total_words = sim.get('sram_reads', 0) + sim.get('sram_writes', 0)
+        sram_total_sectors = int((sram_total_words * 2) / 32)  # 2 bytes/word, 32 bytes/sector
+        print(f"  SRAM total       : {fmt(sram_total_sectors)} sectors (for HW comparison)")
         print(f"  DRAM reads       : {fmt(sim.get('dram_reads'))}")
         print(f"  DRAM writes      : {fmt(sim.get('dram_writes'))}")
 
     if hw and sim:
         print(f"\n  --- Comparison ---")
         for label, hw_val, sim_val in rows:
-            delta = pct_diff(hw_val, sim_val) if not isinstance(hw_val, str) and not isinstance(sim_val, str) else "-"
+            # Extract numeric values for delta calculation (handles "38.6%" strings)
+            def to_num(v):
+                if isinstance(v, (int, float)):
+                    return v
+                if isinstance(v, str) and v.endswith('%'):
+                    try: return float(v[:-1])
+                    except: return None
+                return None
+            hw_num, sim_num = to_num(hw_val), to_num(sim_val)
+            if hw_num is not None and sim_num is not None:
+                delta = pct_diff(hw_num, sim_num)
+            else:
+                delta = "-"
             print(f"  {label:<34} {fmt(hw_val):>18} {fmt(sim_val):>18} {delta:>10}")
 
     sys.stdout = orig

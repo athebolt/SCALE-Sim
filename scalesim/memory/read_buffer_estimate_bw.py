@@ -295,25 +295,11 @@ class ReadBufferEstimateBw:
             self.backing_buffer.service_reads(incoming_cycles_arr=cycles_arr,
                                               incoming_requests_arr_np=prefetch_requests)
 
-        # Create / add elements to the trace matrix
-        this_prefetch_traces = np.concatenate((response_cycles_arr, prefetch_requests), axis=1)
-
         if not self.trace_valid:
-            self.trace_matrix = this_prefetch_traces
+            self.start_cycle = response_cycles_arr[0][0]
             self.trace_valid = True
 
-        else:
-            del_cols = self.trace_matrix.shape[1] - this_prefetch_traces.shape[1]
-            if del_cols > 0:
-                empty_cols = np.ones((this_prefetch_traces.shape[0], del_cols))
-                this_prefetch_traces = np.concatenate((this_prefetch_traces, empty_cols), axis=1)
-
-            elif del_cols < 0:
-                del_cols = int(-1 * del_cols)
-                empty_cols = np.ones((self.trace_matrix.shape[0], del_cols))
-                self.trace_matrix = np.concatenate((self.trace_matrix, empty_cols), axis=1)
-
-            self.trace_matrix = np.concatenate((self.trace_matrix, this_prefetch_traces), axis=0)
+        self.end_cycle = response_cycles_arr[-1][0]
 
     #
     def get_latency(self):
@@ -356,10 +342,7 @@ class ReadBufferEstimateBw:
         Method to get start and stop cycles of the read estimate buffer if trace_valid flag is set.
         """
         assert self.trace_valid, 'Traces not ready yet'
-        start_cycle = self.trace_matrix[0][0]
-        end_cycle = self.trace_matrix[-1][0]
-
-        return start_cycle, end_cycle
+        return self.start_cycle, self.end_cycle
 
     #
     def print_trace(self, filename):

@@ -36,7 +36,6 @@ class scale_config:
         self.valid_conf_flag = False
         self.num_bank = 1
         self.num_port = 2
-        self.tensor_cores = 1
 
         # Layout flags with default values
         self.using_ifmap_custom_layout = False
@@ -63,6 +62,13 @@ class scale_config:
         
         # Time linear model parameter
         self.time_linear_model = 'None'
+
+    # Alex: Added GPU support
+        self.tensor_cores = 1
+        self.operand_size_bytes = 2
+        self.num_sms = 1
+        self.clock_freq_mhz = 1000
+        self.total_bandwidth_gbs = 0
     #
     def read_conf_file(self, conf_file_in):
         """
@@ -100,7 +106,7 @@ class scale_config:
         # Parse TimeLinearModel if present
         if config.has_option(section, 'TimeLinearModel'):
             self.time_linear_model = config.get(section, 'TimeLinearModel')
-            assert self.time_linear_model in ['None', 'TPUv4', 'TPUv5e', 'TPUv6e'], f"ERROR: Invalid time linear model '{self.time_linear_model}'. Must be one of: None, TPUv4, TPUv5e, TPUv6e"
+            assert self.time_linear_model in ['None', 'TPUv4', 'TPUv5e', 'TPUv6e', 'GA10b'], f"ERROR: Invalid time linear model '{self.time_linear_model}'. Must be one of: None, TPUv4, TPUv5e, TPUv6e, GA10b"
 
 
         # TODO Sarbartha: Should be bw
@@ -167,11 +173,19 @@ class scale_config:
 
                 self.sparsity_rand_seed = int(config.get(section, 'RandomNumberGeneratorSeed'))
 
-        # GPU section if simulating a NVIDIA GPU (optional)
+        # GPU - optional section to simulate a GPU
         if config.has_section('gpu'):
-            gpu_section = 'gpu'
-            if config.has_option(gpu_section, 'TensorCores'):
-                self.tensor_cores = int(config.get(gpu_section, 'TensorCores'))
+            section = 'gpu'
+            if config.has_option(section, 'TensorCores'):
+                self.tensor_cores = int(config.get(section, 'TensorCores'))
+            if config.has_option(section, 'OperandSize'):
+                self.operand_size_bytes = int(config.get(section, 'OperandSize'))
+            if config.has_option(section, 'NumSMs'):
+                self.num_sms = int(config.get(section, 'NumSMs'))
+            if config.has_option(section, 'ClockFreqMHz'):
+                self.clock_freq_mhz = int(config.get(section, 'ClockFreqMHz'))
+            if config.has_option(section, 'TotalBandwidthGBs'):
+                self.total_bandwidth_gbs = int(config.get(section, 'TotalBandwidthGBs'))
 
         self.valid_conf_flag = True
 
@@ -503,13 +517,6 @@ class scale_config:
     def get_num_port(self):
         if self.valid_conf_flag:
             return self.num_port
-
-    def get_tensor_cores(self):
-        """
-        Method to get the number of GPU tensor cores for parallel workload division.
-        """
-        if self.valid_conf_flag:
-            return self.tensor_cores
         
     def get_min_dram_bandwidth(self):
         """
@@ -540,3 +547,54 @@ class scale_config:
         dummy_obj.force_valid()
         out_list = dummy_obj.get_conf_as_list()
         return out_list
+
+    def get_tensor_cores(self):
+        """
+        Method to get the number of GPU tensor cores for parallel workload division.
+        """
+        if self.valid_conf_flag:
+            return self.tensor_cores
+
+    def get_operand_size(self):
+        """
+        Method to get the number of bytes per operand.
+        """
+        if self.valid_conf_flag:
+            return self.operand_size_bytes
+        return 1
+
+    def get_num_sms(self):
+        """
+        Method to get the number of streaming multiprocessors (SMs) on the GPU.
+        """
+        if self.valid_conf_flag:
+            return self.num_sms
+        return 1
+
+    def get_clock_freq_mhz(self):
+        """
+        Method to get the GPU clock frequency in MHz.
+        """
+        if self.valid_conf_flag:
+            return self.clock_freq_mhz
+        return 1000
+
+    def is_gpu_mode(self):
+        """
+        Method to check if GPU simulation mode is active.
+        Returns True when tensor_cores > 1 (i.e., a [gpu] section was configured).
+        """
+        if self.valid_conf_flag:
+            return self.tensor_cores > 1
+        return False
+
+    def get_total_bandwidth_gbs(self):
+        """
+        Method to get the total GPU memory bandwidth in GB/s.
+        This is the full system bandwidth used in the roofline model,
+        separate from the per-TC backing bandwidth in [architecture_presets].
+        Falls back to get_min_dram_bandwidth() if not configured.
+        """
+        if self.valid_conf_flag and self.total_bandwidth_gbs > 0:
+            return self.total_bandwidth_gbs
+        return min(self.bandwidths) if self.bandwidths else 10
