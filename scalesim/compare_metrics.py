@@ -105,13 +105,16 @@ def parse_ncu_csv(path):
     conv_dr = sum(d["dram_r"] for d in grouped_data)
     conv_dw = sum(d["dram_w"] for d in grouped_data)
     conv_cyc = sum(d["cycles"] for d in grouped_data)
-    conv_ten = sum(d["tensor_cycles"] for d in grouped_data)
+    
+    # Orin Nano has 8 SMs. hmma.sum is aggregate, cycles.avg is per-SM.
+    # We divide by 8 to get the per-SM tensor contribution for a fair latency comparison.
+    conv_ten = sum(d["tensor_cycles"] for d in grouped_data) / 8.0
 
     return {
         "total_kernels":     len(pivot),
         "conv_kernels":      len(grouped_data),
         "total_cycles":      pivot["sm__cycles_active.avg"].sum() if "sm__cycles_active.avg" in pivot.columns else 0,
-        "tensor_cycles":     pivot["sm__pipe_tensor_op_hmma_cycles_active.sum"].sum() if "sm__pipe_tensor_op_hmma_cycles_active.sum" in pivot.columns else 0,
+        "tensor_cycles":     (pivot["sm__pipe_tensor_op_hmma_cycles_active.sum"].sum() / 8.0) if "sm__pipe_tensor_op_hmma_cycles_active.sum" in pivot.columns else 0,
         "l1_sectors":        pivot["l1tex__t_sectors.sum"].sum() if "l1tex__t_sectors.sum" in pivot.columns else 0,
         "l2_sectors":        pivot["lts__t_sectors.sum"].sum() if "lts__t_sectors.sum" in pivot.columns else 0,
         "dram_read_bytes":   pivot["dram__bytes_read.sum"].sum() if "dram__bytes_read.sum" in pivot.columns else 0,
@@ -223,10 +226,10 @@ def _build_rows(hw, sim):
         sim_sram = sim.get("sram_reads", 0) + sim.get("sram_writes", 0)
         rows.append(("On-chip Memory Access (Bytes)", hw_sram, sim_sram))
 
-        dram_hw  = hw.get("dram_read_bytes", float("nan")) + hw.get("dram_write_bytes", float("nan"))
-        hw_dram  = "N/A (unified mem)" if dram_hw != dram_hw else dram_hw
-        sim_dram = sim.get("dram_reads", 0) + sim.get("dram_writes", 0)
-        rows.append(("Off-chip (DRAM) Access (Bytes)", hw_dram, sim_dram))
+        # dram_hw  = hw.get("dram_read_bytes", float("nan")) + hw.get("dram_write_bytes", float("nan"))
+        # hw_dram  = "N/A (unified mem)" if dram_hw != dram_hw else dram_hw
+        # sim_dram = sim.get("dram_reads", 0) + sim.get("dram_writes", 0)
+        # rows.append(("Off-chip (DRAM) Access (Bytes)", hw_dram, sim_dram))
 
         rows.append(("Tensor Compute Cycles",
                      hw.get("conv_tensor_cycles"),
